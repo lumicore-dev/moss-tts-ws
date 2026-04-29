@@ -28,14 +28,14 @@ pip install -r requirements.txt
 python server.py
 ```
 
-默认监听 `0.0.0.0:8765`，WebSocket 端点 `/tts`。
+默认监听 `0.0.0.0:8767`，WebSocket 端点 `/tts`。
 
 ## 参数
 
 | 参数 | 说明 |
 |------|------|
 | `--host` | 监听地址，默认 `0.0.0.0` |
-| `--port` | 端口，默认 `8765` |
+| `--port` | 端口，默认 `8767` |
 | `--model-dir` | ONNX 模型目录 |
 | `--execution-provider` | `cpu` 或 `cuda` |
 | `--log-level` | `DEBUG / INFO / WARNING / ERROR` |

@@ -333,7 +333,7 @@ async def websocket_tts(ws: WebSocket):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8767)
     parser.add_argument("--model-dir", default=str(_PROJECT_ROOT / "onnx_models"))
     parser.add_argument("--execution-provider", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--log-level", default="INFO")
