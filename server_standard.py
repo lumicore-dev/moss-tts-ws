@@ -53,6 +53,11 @@ API_PREFIX = "/api/v1"
 TARGET_CHUNK_SEC = 0.30       # 每个 audio chunk 的目标时长（秒）
 ENGINE_NAME = "moss-tts"
 ENGINE_VERSION = "0.3.0"
+DEFAULT_VOICE = "Yuewen"
+
+# ── 自定义参考音频 ───────────────────────────────────────────────
+# 使用 "Dabao" voice 时，用这个文件做实时编码克隆
+DABAO_REFERENCE_AUDIO = str(_PROJECT_ROOT / "voice_samples" / "oknv_ref.wav")
 
 logger = logging.getLogger("tts-standard")
 
@@ -125,7 +130,7 @@ async def get_runtime(
     model_dir: str | Path,
     execution_provider: str = "cpu",
 ) -> OnnxTtsRuntime:
-    """懒加载全局运行时"""
+    """懒加载全局运行时（仅 REST 端点使用，或退化保底）"""
     global _runtime
     if _runtime is None:
         async with _runtime_lock:
@@ -139,6 +144,51 @@ async def get_runtime(
                 logger.info("Runtime loaded. %d voices available.",
                             len(_runtime.list_builtin_voices()))
     return _runtime
+
+
+# ── Runtime Pool for Parallel WebSocket Synthesis ─────────────
+_RUNTIME_POOL: list[OnnxTtsRuntime] = []
+_RUNTIME_POOL_SEM: asyncio.Semaphore | None = None
+_RUNTIME_POOL_SIZE = 4  # 4 concurrent synthesis = 002 can finish before 001
+
+
+async def init_runtime_pool():
+    """Eagerly initialize the runtime pool at server startup."""
+    global _RUNTIME_POOL, _RUNTIME_POOL_SEM
+    if _RUNTIME_POOL:
+        return
+    _RUNTIME_POOL_SEM = asyncio.Semaphore(_RUNTIME_POOL_SIZE)
+    model_dir = _PROJECT_ROOT / "onnx_models"
+    logger.info(
+        "Initializing runtime pool (%d instances)...", _RUNTIME_POOL_SIZE)
+    for i in range(_RUNTIME_POOL_SIZE):
+        rt = await asyncio.to_thread(
+            OnnxTtsRuntime,
+            model_dir=str(model_dir),
+            execution_provider="cpu",
+        )
+        _RUNTIME_POOL.append(rt)
+    logger.info(
+        "Runtime pool ready. %d instances, %d voices available.",
+        len(_RUNTIME_POOL),
+        len(_RUNTIME_POOL[0].list_builtin_voices()),
+    )
+
+    # Also set _runtime for REST endpoints
+    global _runtime
+    _runtime = _RUNTIME_POOL[0]
+
+
+async def acquire_runtime() -> OnnxTtsRuntime:
+    """Acquire a runtime from the pool (async wait if all busy)."""
+    await _RUNTIME_POOL_SEM.acquire()
+    return _RUNTIME_POOL.pop()
+
+
+def release_runtime(rt: OnnxTtsRuntime):
+    """Return a runtime to the pool."""
+    _RUNTIME_POOL.append(rt)
+    _RUNTIME_POOL_SEM.release()
 
 
 def _get_voices_list() -> list[dict]:
@@ -161,7 +211,6 @@ app = FastAPI(title=f"Unified TTS Server ({ENGINE_NAME})", version=ENGINE_VERSIO
 async def api_info():
     """引擎能力发现"""
     voices = _get_voices_list()
-    default_voice = voices[0]["voice"] if voices else "Junhao"
     return {
         "engine": {
             "name": ENGINE_NAME,
@@ -185,7 +234,7 @@ async def api_info():
         "voices": {
             "type": "predefined",
             "dynamic": False,
-            "default": default_voice,
+            "default": DEFAULT_VOICE,
         },
         "formats": {
             "sample_rates": [48000],
@@ -326,11 +375,18 @@ def _run_streaming_synthesis(
     target_channels: int,
     cancel_event: threading.Event,
     cb_send_audio: callable,
+    audio_temperature: float | None = None,
+    audio_top_k: int | None = None,
+    audio_top_p: float | None = None,
+    audio_repetition_penalty: float | None = None,
+    prompt_audio_path: str | None = None,
 ) -> dict:
     """
     在同步线程中执行流式合成。
     通过 cb_send_audio(pcm_bytes, sample_rate, channels, seq) 回调实时推送音频。
     通过 cancel_event 支持中断。
+    prompt_audio_path: 如果传了，就实时编码这个文件作为参考音色，
+                       否则用内置 voice 的预编码数据。
     """
     # 参数注入
     if max_new_frames is not None:
@@ -340,6 +396,14 @@ def _run_streaming_synthesis(
     runtime.manifest["generation_defaults"]["do_sample"] = do_sample
     if seed is not None:
         runtime.rng = np.random.default_rng(int(seed))
+    if audio_temperature is not None:
+        runtime.manifest["generation_defaults"]["audio_temperature"] = float(audio_temperature)
+    if audio_top_k is not None:
+        runtime.manifest["generation_defaults"]["audio_top_k"] = int(audio_top_k)
+    if audio_top_p is not None:
+        runtime.manifest["generation_defaults"]["audio_top_p"] = float(audio_top_p)
+    if audio_repetition_penalty is not None:
+        runtime.manifest["generation_defaults"]["audio_repetition_penalty"] = float(audio_repetition_penalty)
 
     if cancel_event.is_set():
         return {"cancelled": True, "total_frames": 0, "total_audio_samples": 0}
@@ -349,8 +413,8 @@ def _run_streaming_synthesis(
         prepared_texts = runtime.prepare_synthesis_text(
             text=text,
             voice=str(voice or ""),
-            enable_wetext=True,
-            enable_normalize_tts_text=True,
+            enable_wetext=False,
+            enable_normalize_tts_text=False,
         )
         prepared_text = str(prepared_texts["text"])
     except Exception as e:
@@ -360,8 +424,10 @@ def _run_streaming_synthesis(
         return {"cancelled": True, "total_frames": 0, "total_audio_samples": 0}
 
     # 获取 prompt audio codes
+    # 如果有 prompt_audio_path，实时编码参考音频；否则用内置 voice 的预编码数据
     prompt_audio_codes = runtime.resolve_prompt_audio_codes(
-        voice=voice, prompt_audio_path=None,
+        voice=voice,
+        prompt_audio_path=prompt_audio_path,
     )
 
     # 按句分割
@@ -471,30 +537,191 @@ def _run_streaming_synthesis(
 
 
 # ── WebSocket 端点 ───────────────────────────────────────────────
-
 @app.websocket(f"{API_PREFIX}/synthesize")
 async def websocket_synthesize(ws: WebSocket):
+    """
+    并行合成 WebSocket 端点。
+
+    ── 核心设计 ──
+    1. 主循环仅负责接收 WebSocket 消息，收到 synthesize 请求后立即创建
+       asyncio.Task 并发执行，不 await 等待合成完成。
+    2. 每个合成任务从全局 Runtime Pool 中获取一个独立的 OnnxTtsRuntime 实例，
+       因此多个句子可以真正并行推理（短句先完成、先发 done）。
+    3. 所有任务通过共享的 send_queue 发送音频/done/error 消息，
+       sender 协程负责将消息写回 WebSocket。
+    4. 客户端通过 RequestID 区分属于不同句子的音频包，
+       Go 网关层的 Map 缓冲区自动完成乱序拼装。
+
+    ── 关键好处 ──
+    - 客户端可以 1 秒内推送整个批次的文本，服务端立即全部 RECV_TEXT
+    - 短句（002）即使比长句（001）后收到，也可能先合成完成、先下发 done
+    - 取消或断开时，所有正在合成的任务被优雅终止
+    """
     await ws.accept()
-    runtime = await get_runtime(
-        _PROJECT_ROOT / "onnx_models",
-        execution_provider="cpu",
-    )
     logger.info("WebSocket connected: %s", ws.client)
 
     send_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    running_tasks: list[asyncio.Task] = []
 
+    # ── sender: 将队列消息写回 WebSocket ──────────────────────
     async def _sender():
         while True:
             msg = await send_queue.get()
             if msg is None:
                 break
-            await ws.send_text(msg)
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                break
 
     sender_task = asyncio.create_task(_sender())
 
+    # ── 单个合成任务（并发执行） ──────────────────────────────
+    async def _run_synthesis(data: dict):
+        """Receive a request, acquire runtime, run synthesis, send results."""
+        runtime: OnnxTtsRuntime | None = None
+        request_id = ""
+        try:
+            # 1. Acquire a runtime from the pool (may wait if all busy)
+            try:
+                runtime = await acquire_runtime()
+            except asyncio.CancelledError:
+                return  # Task cancelled before getting runtime, nothing to clean
+
+            request_id = data.get("request_id", str(uuid.uuid4()))
+            text = data.get("text", "").strip()
+
+            # ── 立即打印 RECV_TEXT 日志 ──────────────────────
+            logger.info("RECV_TEXT: req=%s client=%s text=%r text_len=%d",
+                        request_id, ws.client, text, len(text))
+
+            # ── 校验 ──────────────────────────────────────────
+            if not text:
+                await send_queue.put(
+                    _build_error_msg(request_id, "INVALID_TEXT",
+                                     "text cannot be empty"))
+                return
+
+            if data.get("ssml", False):
+                await send_queue.put(
+                    _build_error_msg(request_id, "SSML_NOT_SUPPORTED",
+                                     "This engine does not support SSML."))
+                return
+
+            fmt = data.get("format", {})
+            target_encoding = fmt.get("encoding", "pcm_f32le")
+            target_sample_rate = fmt.get("sample_rate", 48000)
+            target_channels = fmt.get("channels", 2)
+            if target_encoding not in ("pcm_f32le", "pcm_s16le"):
+                await send_queue.put(
+                    _build_error_msg(request_id, "INVALID_FORMAT",
+                                     f"Unsupported encoding: {target_encoding}"))
+                return
+
+            # ── 参数解析 ──────────────────────────────────────
+            voice = data.get("voice", DEFAULT_VOICE)
+            opts = data.get("options", {})
+            sample_mode = opts.get("sample_mode")
+            do_sample = opts.get("do_sample", True)
+            seed = opts.get("seed")
+            max_new_frames = opts.get("max_new_frames")
+            voice_clone_max_text_tokens = opts.get(
+                "voice_clone_max_text_tokens", 75)
+            audio_temperature = opts.get("audio_temperature", 0.78)
+            audio_top_k = opts.get("audio_top_k", 22)
+            audio_top_p = opts.get("audio_top_p", 0.92)
+            audio_repetition_penalty = opts.get("audio_repetition_penalty", 1.2)
+
+            prompt_audio_path = None
+            if voice == "Dabao":
+                prompt_audio_path = DABAO_REFERENCE_AUDIO
+                logger.info(
+                    "Using custom reference audio for Dabao: %s",
+                    prompt_audio_path)
+
+            # ── 取消事件 ──────────────────────────────────────
+            cancel_event = threading.Event()
+            with _active_requests_lock:
+                _active_requests[request_id] = cancel_event
+
+            logger.info(
+                "Synthesize: req=%s client=%s text=%r text_len=%d voice=%s params=%s",
+                request_id, ws.client, text, len(text), voice or "default",
+                json.dumps(data.get("options", {}), ensure_ascii=False),
+            )
+
+            t0 = time.perf_counter()
+
+            # ── 音频回调（每个任务独立的闭包，携带自己的 request_id） ──
+            def _on_audio(pcm: bytes, sr: int, ch: int, seq: int):
+                msg = _build_audio_msg(
+                    request_id, seq, pcm, sr, target_encoding, ch, False,
+                )
+                send_queue.put_nowait(msg)
+
+            # ── 在独立线程中执行流式合成 ──────────────────────
+            try:
+                result = await asyncio.to_thread(
+                    _run_streaming_synthesis,
+                    runtime, text, voice,
+                    sample_mode, do_sample, seed,
+                    max_new_frames, voice_clone_max_text_tokens,
+                    target_encoding, target_sample_rate, target_channels,
+                    cancel_event, _on_audio,
+                    audio_temperature, audio_top_k, audio_top_p,
+                    audio_repetition_penalty,
+                    prompt_audio_path,
+                )
+            except asyncio.CancelledError:
+                cancel_event.set()
+                raise
+
+            elapsed = time.perf_counter() - t0
+
+            if not result.get("cancelled", False):
+                # final chunk (zero-length audio with is_final=True)
+                await send_queue.put(
+                    _build_audio_msg(request_id, 0, b"", target_sample_rate,
+                                     target_encoding, target_channels, True))
+                # done signal
+                sr = result["sample_rate"]
+                audio_sec = result["total_audio_samples"] / sr if sr else 0
+                await send_queue.put(
+                    _build_done_msg(request_id, result["total_frames"],
+                                    audio_sec, elapsed))
+                logger.info(
+                    "Done: req=%s %.2fs audio, %.2fs inference (%.2fx)",
+                    request_id, audio_sec, elapsed,
+                    audio_sec / elapsed if elapsed else 0,
+                )
+
+        except asyncio.CancelledError:
+            pass  # Task was cancelled gracefully
+        except RuntimeError as e:
+            if request_id:
+                await send_queue.put(
+                    _build_error_msg(request_id, "ENGINE_ERROR", str(e)))
+                logger.exception("Engine error for req=%s", request_id)
+        except Exception as e:
+            if request_id:
+                await send_queue.put(
+                    _build_error_msg(request_id, "ENGINE_ERROR", str(e)))
+                logger.exception("Unexpected error for req=%s", request_id)
+        finally:
+            if request_id:
+                with _active_requests_lock:
+                    _active_requests.pop(request_id, None)
+            if runtime:
+                release_runtime(runtime)
+
+    # ── 主循环：仅负责接收 WebSocket 消息，不做合成 ──────────
     try:
         while True:
-            raw = await ws.receive_text()
+            try:
+                raw = await ws.receive_text()
+            except Exception:
+                break
+
             data = json.loads(raw)
             msg_type = data.get("type", "")
 
@@ -524,7 +751,7 @@ async def websocket_synthesize(ws: WebSocket):
                 }))
                 continue
 
-            # ── synthesize ─────────────────────────────────────
+            # ── synthesize: 创建并发任务，不 await！───────────
             if msg_type != "synthesize":
                 await send_queue.put(
                     _build_error_msg(data.get("request_id", ""),
@@ -532,103 +759,11 @@ async def websocket_synthesize(ws: WebSocket):
                                      f"Unknown message type: {msg_type}"))
                 continue
 
-            # ── 字段校验 ──────────────────────────────────────
-            request_id = data.get("request_id", str(uuid.uuid4()))
-            text = data.get("text", "").strip()
-            if not text:
-                await send_queue.put(
-                    _build_error_msg(request_id, "INVALID_TEXT",
-                                     "text cannot be empty"))
-                continue
-
-            # ── SSML 检查 ─────────────────────────────────────
-            if data.get("ssml", False):
-                await send_queue.put(
-                    _build_error_msg(request_id, "SSML_NOT_SUPPORTED",
-                                     "This engine does not support SSML. "
-                                     "Set ssml=false or use a different engine. "
-                                     "See /api/v1/info for capabilities."))
-                continue
-
-            # ── 格式协商 ──────────────────────────────────────
-            fmt = data.get("format", {})
-            target_encoding = fmt.get("encoding", "pcm_f32le")
-            target_sample_rate = fmt.get("sample_rate", 48000)
-            target_channels = fmt.get("channels", 2)
-            if target_encoding not in ("pcm_f32le", "pcm_s16le"):
-                await send_queue.put(
-                    _build_error_msg(request_id, "INVALID_FORMAT",
-                                     f"Unsupported encoding: {target_encoding}. "
-                                     f"Supported: pcm_f32le, pcm_s16le"))
-                continue
-
-            # ── 参数解析 ──────────────────────────────────────
-            voice = data.get("voice")
-            opts = data.get("options", {})
-            sample_mode = opts.get("sample_mode")
-            do_sample = opts.get("do_sample", True)
-            seed = opts.get("seed")
-            max_new_frames = opts.get("max_new_frames")
-            voice_clone_max_text_tokens = opts.get("voice_clone_max_text_tokens", 75)
-
-            # ── 注册取消事件 ─────────────────────────────────
-            cancel_event = threading.Event()
-            with _active_requests_lock:
-                _active_requests[request_id] = cancel_event
-
-            logger.info(
-                "Synthesize: req=%s text_len=%d voice=%s fmt=%s/%dch/%dHz",
-                request_id, len(text), voice or "default",
-                target_encoding, target_channels, target_sample_rate,
-            )
-
-            t0 = time.perf_counter()
-
-            def _on_audio(pcm: bytes, sr: int, ch: int, seq: int):
-                msg = _build_audio_msg(
-                    request_id, seq, pcm, sr, target_encoding, ch, False,
-                )
-                send_queue.put_nowait(msg)
-
-            try:
-                result = await asyncio.to_thread(
-                    _run_streaming_synthesis,
-                    runtime, text, voice,
-                    sample_mode, do_sample, seed,
-                    max_new_frames, voice_clone_max_text_tokens,
-                    target_encoding, target_sample_rate, target_channels,
-                    cancel_event, _on_audio,
-                )
-
-                elapsed = time.perf_counter() - t0
-
-                if not result.get("cancelled", False):
-                    # final chunk
-                    await send_queue.put(
-                        _build_audio_msg(request_id, 0, b"", target_sample_rate,
-                                          target_encoding, target_channels, True))
-                    # done
-                    sr = result["sample_rate"]
-                    audio_sec = result["total_audio_samples"] / sr if sr else 0
-                    await send_queue.put(
-                        _build_done_msg(request_id, result["total_frames"],
-                                        audio_sec, elapsed))
-                    logger.info(
-                        "Done: req=%s %.2fs audio, %.2fs inference (%.2fx)",
-                        request_id, audio_sec, elapsed,
-                        audio_sec / elapsed if elapsed else 0,
-                    )
-            except RuntimeError as e:
-                await send_queue.put(
-                    _build_error_msg(request_id, "ENGINE_ERROR", str(e)))
-                logger.exception("Engine error for req=%s", request_id)
-            except Exception as e:
-                await send_queue.put(
-                    _build_error_msg(request_id, "ENGINE_ERROR", str(e)))
-                logger.exception("Unexpected error for req=%s", request_id)
-            finally:
-                with _active_requests_lock:
-                    _active_requests.pop(request_id, None)
+            # 🚀 每来一个合成请求，立即创建异步任务并发执行
+            task = asyncio.create_task(_run_synthesis(data))
+            running_tasks.append(task)
+            # 清理已完成的任务，防止内存泄漏
+            running_tasks[:] = [t for t in running_tasks if not t.done()]
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected: %s", ws.client)
@@ -650,11 +785,23 @@ async def websocket_synthesize(ws: WebSocket):
         except Exception:
             pass
     finally:
+        # 取消所有正在运行的任务
+        with _active_requests_lock:
+            for ev in _active_requests.values():
+                ev.set()
+            _active_requests.clear()
+        for task in running_tasks:
+            task.cancel()
+        await asyncio.gather(*running_tasks, return_exceptions=True)
         await send_queue.put(None)
         await sender_task
 
+@app.on_event("startup")
+async def _startup_init_pool():
+    """Initialize the runtime pool on FastAPI server start."""
+    await init_runtime_pool()
 
-# ═══════════════════════════════════════════════════════════════════
+
 #  启动入口
 # ═══════════════════════════════════════════════════════════════════
 
@@ -672,14 +819,14 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    logger.info("Pre-loading model from %s ...", args.model_dir)
-    global _runtime
-    _runtime = OnnxTtsRuntime(
-        model_dir=args.model_dir,
-        execution_provider=args.execution_provider,
-    )
-    voices = _runtime.list_builtin_voices()
-    logger.info("Model loaded. %d voices available.", len(voices))
+    logger.info("Pre-loading runtime pool from %s ...", args.model_dir)
+    # _PROJECT_ROOT is module-level, no global needed
+    global _RUNTIME_POOL_SIZE
+    # Override pool size from cmdline if needed (default 2)
+    asyncio.run(init_runtime_pool())
+    voices = _RUNTIME_POOL[0].list_builtin_voices()
+    logger.info("Runtime pool ready. %d instances, %d voices available.",
+                len(_RUNTIME_POOL), len(voices))
     for v in voices:
         logger.info("  Voice: %s | %s | %s", v["voice"], v["display_name"], v["group"])
 
