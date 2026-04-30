@@ -16,11 +16,15 @@ into a single rigid schema. Instead, it defines:
 - A set of **well-known fields** that most engines share.
 - An **extensible options bag** for engine-specific features.
 
+---
+
 ## 2. Message Envelope
 
 Every JSON message on the WebSocket, in both directions, MUST contain a `type`
 field as the message discriminator. Messages SHOULD include a `request_id` for
 correlation when applicable.
+
+---
 
 ## 3. REST Endpoints
 
@@ -46,7 +50,8 @@ engine.
   "capabilities": {
     "streaming": true,
     "interruptible": true,
-    "ssml": false,
+    "ssml": true,
+    "ssml_version": "1.1",
     "speed_control": false,
     "pitch_control": false,
     "emotion_control": false,
@@ -114,6 +119,20 @@ engine.
 | `parameters` | Standard (well-known) parameters the engine accepts |
 | `options` | Engine-specific parameters with full schema documentation |
 
+#### Capability Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `streaming` | bool | Can stream audio chunks in real time |
+| `interruptible` | bool | Supports `cancel` to abort an in-flight synthesis |
+| `ssml` | bool | Supports SSML (Speech Synthesis Markup Language) input |
+| `ssml_version` | string | SSML specification version supported (e.g. `"1.1"`). Present only if `ssml` is `true`. |
+| `speed_control` | bool | Supports `speed` parameter for speaking rate |
+| `pitch_control` | bool | Supports `pitch` parameter for voice pitch |
+| `emotion_control` | bool | Supports SSML `<mstts:express-as>` or equivalent |
+| `multi_request_per_connection` | bool | Can handle multiple `synthesize` requests on one WebSocket |
+| `max_text_length` | int | Maximum characters per `text` or raw SSML input |
+
 #### Standard Parameter Registry
 
 Well-known parameters that engines SHOULD report in `parameters` if supported:
@@ -139,7 +158,8 @@ Returns the list of available voices.
       "gender": "male",
       "language": ["zh", "en"],
       "group": "builtin",
-      "description": "Default male voice"
+      "description": "Default male voice",
+      "ssml": true
     },
     {
       "id": "Zhiming",
@@ -147,14 +167,17 @@ Returns the list of available voices.
       "gender": "male",
       "language": ["zh", "en"],
       "group": "builtin",
-      "description": "Alternate male voice"
+      "description": "Alternate male voice",
+      "ssml": true
     }
   ]
 }
 ```
 
 The voices listed here serve as the authoritative set of allowed `voice` values
-in synthesis requests.
+in synthesis requests. The optional `ssml` field per voice indicates whether
+that particular voice supports SSML input (if omitted, inherits the engine-level
+`ssml` capability).
 
 ---
 
@@ -179,6 +202,7 @@ request is identified by a unique `request_id`.
   "request_id": "req-001",
   "text": "你好，世界！Hello, world!",
   "voice": "Junhao",
+  "ssml": false,
   "format": {
     "sample_rate": 24000,
     "encoding": "pcm_f32le",
@@ -196,8 +220,9 @@ request is identified by a unique `request_id`.
 |-------|----------|-------------|
 | `type` | ✅ | Must be `"synthesize"` |
 | `request_id` | ✅ | Unique identifier for this request; used to correlate `audio`, `done`, and `error` responses |
-| `text` | ✅ | The text to synthesize. Length limits advertised in `/api/v1/info`. |
+| `text` | ✅ | The text or SSML markup to synthesize. Length limits advertised in `/api/v1/info`. |
 | `voice` | ❌ | Voice ID from `/api/v1/voices`. Engine uses default if omitted. |
+| `ssml` | ❌ | If `true`, the `text` field is treated as SSML markup. Default: `false`. If `true` but engine does not support SSML, returns error `SSML_NOT_SUPPORTED`. |
 | `format` | ❌ | Desired audio format. Engine responds with the closest supported format or rejects with an error. |
 | `format.sample_rate` | ❌ | Target sample rate. Default: engine's native rate. |
 | `format.encoding` | ❌ | PCM encoding. Supported values: `pcm_f32le`, `pcm_s16le`. Default: engine default. |
@@ -212,6 +237,29 @@ request is identified by a unique `request_id`.
 | `pcm_s16le` | Signed 16-bit integer little-endian samples |
 | `mu_law` | 8-bit μ-law encoded samples |
 | `opus` | Opus codec in Ogg container (container must be `ogg`) |
+
+##### SSML Input Example
+
+When `ssml` is `true`, the `text` field contains SSML markup:
+
+```json
+{
+  "type": "synthesize",
+  "request_id": "req-002",
+  "voice": "Junhao",
+  "ssml": true,
+  "text": "<speak version='1.1' xmlns='http://www.w3.org/2001/10/synthesis'>\n  你好<break time='500ms'/>世界！\n  <prosody rate='slow'>欢迎使用语音合成。</prosody>\n</speak>",
+  "format": {
+    "sample_rate": 24000,
+    "encoding": "pcm_s16le",
+    "channels": 1
+  }
+}
+```
+
+The engine MUST parse the SSML according to the W3C SSML 1.1 specification.
+Unsupported SSML tags SHOULD be silently ignored rather than causing an error,
+except for structural failures (e.g. unclosed tags, malformed XML).
 
 #### `cancel` — Cancel an ongoing synthesis
 
@@ -282,9 +330,20 @@ client MUST honour the received parameters.
   "engine": "moss-tts",
   "total_audio_frames": 87,
   "audio_duration_sec": 3.52,
-  "inference_elapsed_sec": 0.84
+  "inference_elapsed_sec": 0.84,
+  "text_was_ssml": false
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `type` | `"done"` |
+| `request_id` | Correlates to the `synthesize` request |
+| `engine` | Engine identity that processed this request |
+| `total_audio_frames` | Total audio frames generated |
+| `audio_duration_sec` | Duration of output audio in seconds |
+| `inference_elapsed_sec` | Wall-clock time spent on inference |
+| `text_was_ssml` | If `true`, the input was parsed as SSML. Useful for client-side debugging. |
 
 Sent after the final `audio` chunk. No further messages for this
 `request_id` will follow.
@@ -336,6 +395,8 @@ Engines that do not support timestamping will never emit this message.
 | `INVALID_VOICE` | Specified voice does not exist |
 | `INVALID_FORMAT` | Requested audio format is not supported |
 | `INVALID_OPTION` | An engine-specific option is invalid |
+| `SSML_NOT_SUPPORTED` | `ssml` was set to `true` but the engine does not support SSML |
+| `SSML_PARSE_ERROR` | SSML markup is malformed or contains invalid XML |
 | `RATE_LIMITED` | Too many requests in a given time window |
 | `ENGINE_ERROR` | Internal engine failure (fatal) |
 | `CANCELLED` | Request was cancelled by the client |
@@ -351,7 +412,47 @@ Engines that do not support timestamping will never emit this message.
 
 ---
 
-## 5. Example Client Flow
+## 5. SSML Support Details
+
+### 5.1 Engine Advertised vs. Per-Voice
+
+The engine-level `ssml` and `ssml_version` fields in `/api/v1/info` advertise
+global support. Individual voices MAY optionally declare a per-voice `ssml`
+flag in `/api/v1/voices`:
+
+- If a voice has `"ssml": false`, setting `"ssml": true` for that voice MUST
+  return `SSML_NOT_SUPPORTED`.
+- If a voice omits the `ssml` field, the engine-level `ssml` value applies.
+
+### 5.2 SSML 1.1 — Recommended Tags
+
+Engines that advertise SSML support SHOULD implement at minimum the following
+W3C SSML 1.1 tags:
+
+| Tag | Purpose |
+|-----|---------|
+| `<speak>` | Root element |
+| `<voice>` | Voice selection within markup |
+| `<prosody>` | Rate, pitch, volume control |
+| `<break>` | Pause with specified duration |
+| `<say-as>` | Interpret date, number, currency, etc. |
+| `<phoneme>` | Custom pronunciation via IPA or x-sampa |
+| `<emphasis>` | Word-level emphasis |
+| `<p>` / `<s>` | Paragraph and sentence boundaries |
+
+Tags not in this minimum set MAY be silently ignored by the engine.
+
+### 5.3 SSML Input Size Limit
+
+When `ssml` is `true`, the `max_text_length` limit in `/api/v1/info` applies
+to the raw character count of the SSML markup string (including tags), not
+the extracted plain text.
+
+---
+
+## 6. Example Client Flows
+
+### 6.1 Plain Text Synthesis
 
 ```
 1. Client → GET /api/v1/info
@@ -381,9 +482,43 @@ Engines that do not support timestamping will never emit this message.
 7. Close WebSocket (or reuse for more requests)
 ```
 
+### 6.2 SSML Synthesis
+
+```
+1. Client discovers engine supports SSML (ssml: true, ssml_version: "1.1").
+
+2. Client sends SSML markup:
+   Client → Server:
+   {"type": "synthesize", "request_id": "req-2", "voice": "Junhao",
+    "ssml": true,
+    "text": "<speak>欢迎<break time='300ms'/>使用语音合成。</speak>"}
+
+3. Server → Client:
+   {"type": "audio", "request_id": "req-2", "seq": 0, "data": "...", "is_final": false}
+   {"type": "audio", "request_id": "req-2", "seq": 1, "data": "...", "is_final": true}
+   {"type": "done", "request_id": "req-2", "text_was_ssml": true, ...}
+```
+
+### 6.3 SSML Not Supported
+
+```
+1. Client discovers engine has ssml: false.
+
+2. Client mistakenly sends ssml: true:
+   Client → Server:
+   {"type": "synthesize", "request_id": "req-3", "ssml": true,
+    "text": "<speak>hello</speak>"}
+
+3. Server → Client:
+   {"type": "error", "request_id": "req-3",
+    "code": "SSML_NOT_SUPPORTED",
+    "message": "This engine does not support SSML. Set ssml=false or use a
+                different engine. See /api/v1/info for capabilities."}
+```
+
 ---
 
-## 6. Multi-Engine Proxy (Future)
+## 7. Multi-Engine Proxy (Future)
 
 An optional proxy layer MAY route requests to different engines based on:
 
@@ -394,7 +529,7 @@ This is deliberately left out of the core spec to keep the protocol simple.
 
 ---
 
-## 7. Versioning
+## 8. Versioning
 
 The protocol version is specified in the server's `/api/v1/info` response.
 Breaking changes to the message format will increment the major version and
@@ -402,7 +537,7 @@ be exposed at a new path (e.g. `/api/v2/...`).
 
 ---
 
-## 8. Conventions
+## 9. Conventions
 
 - All JSON messages use UTF-8 encoding.
 - Timestamps are in seconds as float64.
